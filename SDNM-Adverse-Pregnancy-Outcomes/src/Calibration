@@ -1,0 +1,482 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from matplotlib.ticker import MultipleLocator
+from pathlib import Path
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier, GradientBoostingClassifier,
+)
+from sklearn.metrics import brier_score_loss, log_loss
+
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sdv.single_table import CTGANSynthesizer
+from sdv.metadata import SingleTableMetadata
+
+
+# =====================================================
+# CONFIGURATION
+# =====================================================
+DATA_PATH      = "data/Mdata.csv"
+TARGET_COLUMN  = "composite_apo"
+OUTPUT_DIR     = Path("results")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+N_SPLITS       = 10
+RANDOM_STATE   = 42
+CTGAN_EPOCHS   = 300
+N_BINS         = 10
+
+# =====================================================
+# GLOBAL PUBLICATION STYLE
+# =====================================================
+mpl.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 12,
+    "axes.labelsize": 14,
+    "axes.labelweight": "bold",
+    "axes.titlesize": 15,
+    "axes.titleweight": "bold",
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 10.5,
+    "legend.frameon": True,
+    "legend.framealpha": 0.95,
+    "legend.edgecolor": "black",
+    "axes.linewidth": 1.2,
+    "savefig.dpi": 600,
+    "figure.dpi": 600,
+    "axes.grid": True,
+    "grid.alpha": 0.3,
+    "grid.linestyle": "--",
+})
+
+
+# =====================================================
+# LOAD DATA
+# =====================================================
+def load_and_preprocess(path, target):
+    df = pd.read_csv(path)
+    drop_cols = [c for c in ["Admission number ", "Date of admission"]
+                 if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    y = df[target].values
+    X = df.drop(columns=[target])
+    X = X.apply(pd.to_numeric, errors="coerce")
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(X.median()).values
+    return X, y
+
+
+# =====================================================
+# DNM & SDNM
+# =====================================================
+class DNM:
+    def __init__(self, n_branches=5, lr=0.01, epochs=600):
+        self.n_branches, self.lr, self.epochs = n_branches, lr, epochs
+
+    def _sigmoid(self, x):
+        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+
+    def fit(self, X, y):
+        n, d = X.shape
+        self.W = np.random.randn(self.n_branches, d) * 0.1
+        self.b = 0.0
+        for _ in range(self.epochs):
+            prod = np.prod(
+                X[:, None, :] * self.W[None, :, :] + 1e-6, axis=2)
+            z = prod.sum(axis=1) + self.b
+            y_hat = self._sigmoid(z)
+            error = y_hat - y
+            grad_b = np.mean(error)
+            grad_W = np.zeros_like(self.W)
+            for i in range(self.n_branches):
+                temp = (prod[:, i][:, None] /
+                        (X * self.W[i] + 1e-6)) * X
+                grad_W[i] = np.mean(error[:, None] * temp, axis=0)
+            self.W -= self.lr * grad_W
+            self.b -= self.lr * grad_b
+        return self
+
+    def predict_proba(self, X):
+        prod = np.prod(
+            X[:, None, :] * self.W[None, :, :] + 1e-6, axis=2)
+        z = prod.sum(axis=1) + self.b
+        p = self._sigmoid(z)
+        return np.column_stack([1 - p, p])
+
+
+class SDNM:
+    def __init__(self, input_dim, n_branches=4, lr=0.042, epochs=493,
+                 beta1=0.90, beta2=0.999, eps=1e-8):
+        self.n_branches, self.lr, self.epochs = n_branches, lr, epochs
+        self.beta1, self.beta2, self.eps = beta1, beta2, eps
+        self.Wd = np.random.randn(n_branches, input_dim) * 0.1
+        self.Wl = np.random.randn(input_dim) * 0.1
+        self.b = 0.0
+        self.mWd = np.zeros_like(self.Wd); self.vWd = np.zeros_like(self.Wd)
+        self.mWl = np.zeros_like(self.Wl); self.vWl = np.zeros_like(self.Wl)
+        self.mb, self.vb, self.t = 0, 0, 0
+
+    def _sigmoid(self, z):
+        return 1 / (1 + np.exp(-np.clip(z, -500, 500)))
+
+    def _forward(self, X):
+        eps = 1e-6
+        mult = np.abs(X[:, None, :] * self.Wd[None, :, :]) + eps
+        log_prod = np.sum(np.log(mult), axis=2)
+        dendritic = np.exp(np.clip(log_prod, -500, 500))
+        soma = dendritic.sum(axis=1) + X @ self.Wl + self.b
+        return self._sigmoid(soma), dendritic
+
+    def _adam(self, param, grad, m, v):
+        self.t += 1
+        m = self.beta1 * m + (1 - self.beta1) * grad
+        v = self.beta2 * v + (1 - self.beta2) * (grad ** 2)
+        m_hat = m / (1 - self.beta1 ** self.t)
+        v_hat = v / (1 - self.beta2 ** self.t)
+        param -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+        return param, m, v
+
+    def fit(self, X, y):
+        n = len(y)
+        for _ in range(self.epochs):
+            pred, dendritic = self._forward(X)
+            delta = (pred - y) * pred * (1 - pred)
+            gWl = (X.T @ delta) / n
+            gb = delta.mean()
+            gWd = np.zeros_like(self.Wd)
+            for b in range(self.n_branches):
+                grad = (delta[:, None] * dendritic[:, b:b + 1]) / \
+                       (X * self.Wd[b] + 1e-6)
+                gWd[b] = grad.mean(axis=0)
+            self.Wl, self.mWl, self.vWl = self._adam(
+                self.Wl, gWl, self.mWl, self.vWl)
+            self.b, self.mb, self.vb = self._adam(
+                self.b, gb, self.mb, self.vb)
+            self.Wd, self.mWd, self.vWd = self._adam(
+                self.Wd, gWd, self.mWd, self.vWd)
+        return self
+
+    def predict_proba(self, X):
+        p, _ = self._forward(X)
+        return np.column_stack([1 - p, p])
+
+
+# =====================================================
+# FOLD-WISE CTGAN (matches main.py)
+# =====================================================
+def ctgan_augment_minority(X_train, y_train, epochs=300,
+                           random_state=42):
+    minority_mask = y_train == 1
+    X_minor = X_train[minority_mask]
+    n_major = int((y_train == 0).sum())
+    n_minor = int(minority_mask.sum())
+    n_synth = n_major - n_minor
+
+    if n_synth <= 0 or n_minor < 10:
+        return X_train, y_train
+
+    cols = [f"f{i}" for i in range(X_minor.shape[1])]
+    df_minor = pd.DataFrame(X_minor, columns=cols)
+    metadata = SingleTableMetadata()
+    metadata.detect_from_dataframe(df_minor)
+    ctgan = CTGANSynthesizer(metadata, epochs=epochs, verbose=False)
+    ctgan.fit(df_minor)
+    df_synth = ctgan.sample(num_rows=n_synth)
+    X_synth = df_synth[cols].values
+
+    X_balanced = np.vstack([X_train, X_synth])
+    y_balanced = np.concatenate(
+        [y_train, np.ones(len(X_synth), dtype=int)])
+    return X_balanced, y_balanced
+
+
+# =====================================================
+# CALIBRATION METRIC HELPERS
+# =====================================================
+def compute_ece_mce(y_true, y_prob, n_bins=10):
+    y_true = np.asarray(y_true); y_prob = np.asarray(y_prob)
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_ids = np.digitize(y_prob, bin_edges[1:-1], right=True)
+    ece, mce = 0.0, 0.0
+    N = len(y_true)
+    for b in range(n_bins):
+        mask = bin_ids == b
+        n_b = mask.sum()
+        if n_b == 0:
+            continue
+        acc_b = y_true[mask].mean()
+        conf_b = y_prob[mask].mean()
+        gap = abs(acc_b - conf_b)
+        ece += (n_b / N) * gap
+        mce = max(mce, gap)
+    return ece, mce
+
+
+def compute_all_calibration(y_true, y_prob, n_bins=10):
+    return {
+        "Brier":   brier_score_loss(y_true, y_prob),
+        "LogLoss": log_loss(y_true,
+                            np.clip(y_prob, 1e-15, 1 - 1e-15)),
+        "ECE":     compute_ece_mce(y_true, y_prob, n_bins)[0],
+        "MCE":     compute_ece_mce(y_true, y_prob, n_bins)[1],
+    }
+
+
+def reliability_curve(y_true, y_prob, n_bins=10):
+    y_true = np.asarray(y_true); y_prob = np.asarray(y_prob)
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_ids = np.digitize(y_prob, bin_edges[1:-1], right=True)
+    mp, ef, ct = [], [], []
+    for b in range(n_bins):
+        mask = bin_ids == b
+        n_b = mask.sum()
+        if n_b == 0:
+            continue
+        mp.append(y_prob[mask].mean())
+        ef.append(y_true[mask].mean())
+        ct.append(n_b)
+    return np.array(mp), np.array(ef), np.array(ct)
+
+
+# =====================================================
+# MAIN
+# =====================================================
+def main():
+    print("=" * 60)
+    print("Calibration Analysis — SDNM & Baselines")
+    print("Fold-wise CTGAN + 10-fold Stratified CV")
+    print("=" * 60)
+
+    X, y = load_and_preprocess(DATA_PATH, TARGET_COLUMN)
+    print(f"Dataset: {X.shape}, classes: {np.bincount(y)}")
+
+    models = {
+        "DT":   DecisionTreeClassifier(
+                    max_depth=2, min_samples_split=10,
+                    random_state=RANDOM_STATE),
+        "RF":   RandomForestClassifier(
+                    n_estimators=5, max_depth=2,
+                    min_samples_split=5,
+                    random_state=RANDOM_STATE),
+        "GBM":  GradientBoostingClassifier(
+                    n_estimators=5, learning_rate=0.05,
+                    max_depth=2, random_state=RANDOM_STATE),
+        "XGBM": XGBClassifier(
+                    n_estimators=5, max_depth=2,
+                    learning_rate=0.05, subsample=0.8,
+                    colsample_bytree=0.8,
+                    eval_metric="logloss",
+                    random_state=RANDOM_STATE),
+        "LGBM": LGBMClassifier(
+                    n_estimators=5, num_leaves=4,
+                    learning_rate=0.05, max_depth=2,
+                    random_state=RANDOM_STATE, verbose=-1),
+    }
+
+    all_models = list(models.keys()) + ["DNM", "SDNM"]
+    per_fold_metrics = {m: {"Brier": [], "LogLoss": [],
+                            "ECE": [], "MCE": []}
+                        for m in all_models}
+    reliability_data = {m: {"pred": [], "freq": []}
+                        for m in all_models}
+
+    skf = StratifiedKFold(
+        n_splits=N_SPLITS, shuffle=True,
+        random_state=RANDOM_STATE)
+
+    for fold, (train, test) in enumerate(skf.split(X, y), 1):
+        print(f"Fold {fold}/{N_SPLITS}")
+        X_train_raw, X_test = X[train], X[test]
+        y_train_raw, y_test = y[train], y[test]
+
+        # Fold-wise CTGAN
+        X_train, y_train = ctgan_augment_minority(
+            X_train_raw, y_train_raw,
+            epochs=CTGAN_EPOCHS,
+            random_state=RANDOM_STATE + fold)
+
+        # Tree-based
+        for name, model in models.items():
+            model.fit(X_train, y_train)
+            prob = model.predict_proba(X_test)[:, 1]
+            for k, v in compute_all_calibration(
+                    y_test, prob, N_BINS).items():
+                per_fold_metrics[name][k].append(v)
+            mp, ef, _ = reliability_curve(y_test, prob, N_BINS)
+            reliability_data[name]["pred"].append(mp)
+            reliability_data[name]["freq"].append(ef)
+
+        # Scaled neural inputs
+        scaler = StandardScaler()
+        Xtr = scaler.fit_transform(X_train)
+        Xte = scaler.transform(X_test)
+
+        for name, model in [
+            ("DNM",  DNM(n_branches=DNM_N_BRANCHES,
+                         lr=DNM_LR, epochs=DNM_EPOCHS)),
+            ("SDNM", SDNM(input_dim=X.shape[1],
+                          n_branches=SDNM_N_BRANCHES,
+                          lr=SDNM_LR, epochs=SDNM_EPOCHS,
+                          beta1=SDNM_BETA1, beta2=SDNM_BETA2,
+                          eps=SDNM_EPS)),
+        ]:
+            model.fit(Xtr, y_train)
+            prob = model.predict_proba(Xte)[:, 1]
+            for k, v in compute_all_calibration(
+                    y_test, prob, N_BINS).items():
+                per_fold_metrics[name][k].append(v)
+            mp, ef, _ = reliability_curve(y_test, prob, N_BINS)
+            reliability_data[name]["pred"].append(mp)
+            reliability_data[name]["freq"].append(ef)
+
+    # =================================================
+    # SUMMARY TABLE
+    # =================================================
+    print("\n" + "=" * 90)
+    print("CALIBRATION METRICS — 10-FOLD CV (mean ± std)")
+    print("=" * 90)
+    print(f"{'Model':<8}{'Brier ↓':>18}{'LogLoss ↓':>18}"
+          f"{'ECE ↓':>16}{'MCE ↓':>16}")
+    print("-" * 90)
+
+    summary = {}
+    for m in all_models:
+        row = {}
+        for k in ["Brier", "LogLoss", "ECE", "MCE"]:
+            vals = np.array(per_fold_metrics[m][k])
+            row[k] = (vals.mean(), vals.std())
+        summary[m] = row
+        print(f"{m:<8}"
+              f"{row['Brier'][0]:>10.4f} ± {row['Brier'][1]:<6.4f}"
+              f"{row['LogLoss'][0]:>10.4f} ± {row['LogLoss'][1]:<6.4f}"
+              f"{row['ECE'][0]:>10.4f} ± {row['ECE'][1]:<4.4f}"
+              f"{row['MCE'][0]:>10.4f} ± {row['MCE'][1]:<4.4f}")
+    print("=" * 90)
+
+    pd.DataFrame({
+        m: {k: f"{summary[m][k][0]:.4f} ± {summary[m][k][1]:.4f}"
+            for k in summary[m]}
+        for m in summary
+    }).T.to_csv(OUTPUT_DIR / "calibration_summary.csv")
+    print(f"\nSaved: {OUTPUT_DIR / 'calibration_summary.csv'}")
+
+    # =================================================
+    # FIGURE 1: RELIABILITY DIAGRAM
+    # =================================================
+    colors = {
+        "DT":   "#1f77b4", "RF":  "#2ca02c",
+        "GBM":  "#ff7f0e", "XGBM": "#9467bd",
+        "LGBM": "#8c564b", "DNM":  "#7f7f7f",
+        "SDNM": "#d62728",
+    }
+
+    grid = np.linspace(0.02, 0.98, 50)
+    fig, ax = plt.subplots(figsize=(8.5, 7.5), dpi=600)
+    ax.plot([0, 1], [0, 1], linestyle="--", color="black",
+            linewidth=1.5, label="Perfect calibration", zorder=1)
+
+    for m in all_models:
+        curves = []
+        for mp, ef in zip(reliability_data[m]["pred"],
+                          reliability_data[m]["freq"]):
+            if len(mp) >= 2:
+                curves.append(np.interp(grid, mp, ef))
+        if not curves:
+            continue
+        mean_curve = np.mean(curves, axis=0)
+        std_curve = np.std(curves, axis=0)
+        if m == "SDNM":
+            ax.plot(grid, mean_curve, color=colors[m],
+                    linewidth=3.5, label=f"{m} (ours)",
+                    zorder=10, solid_capstyle="round")
+            ax.fill_between(grid,
+                            mean_curve - std_curve,
+                            mean_curve + std_curve,
+                            color=colors[m], alpha=0.18, zorder=3)
+        else:
+            ax.plot(grid, mean_curve, color=colors[m],
+                    linewidth=2.0, alpha=0.85,
+                    label=m, zorder=5)
+
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.set_xlabel("Mean Predicted Probability",
+                  fontsize=14, fontweight="bold")
+    ax.set_ylabel("Empirical Fraction of Positives",
+                  fontsize=14, fontweight="bold")
+    ax.set_title("Reliability Diagram — 10-Fold Cross-Validation",
+                 fontsize=15, fontweight="bold", pad=10)
+    ax.xaxis.set_major_locator(MultipleLocator(0.1))
+    ax.yaxis.set_major_locator(MultipleLocator(0.1))
+    ax.legend(loc="upper left", fontsize=10, ncol=2,
+              framealpha=0.95, edgecolor="black")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "Calibration_ReliabilityDiagram_600dpi.png",
+                dpi=600, bbox_inches="tight", facecolor="white")
+    plt.savefig(OUTPUT_DIR / "Calibration_ReliabilityDiagram_600dpi.pdf",
+                bbox_inches="tight", facecolor="white")
+    plt.show()
+
+    # =================================================
+    # FIGURE 2: BAR CHART (4 metrics)
+    # =================================================
+    metric_labels = {
+        "MCE":     "Maximum Calibration Error (MCE)",
+        "ECE":     "Expected Calibration Error (ECE)",
+        "Brier":   "Brier Score (BS)",
+        "LogLoss": "Log Loss",
+    }
+    metric_order = ["MCE", "ECE", "Brier", "LogLoss"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), dpi=600)
+    axes = axes.flatten()
+
+    for i, metric in enumerate(metric_order):
+        ax = axes[i]
+        means = [summary[m][metric][0] for m in all_models]
+        stds = [summary[m][metric][1] for m in all_models]
+        bar_colors = [colors[m] for m in all_models]
+        bars = ax.bar(all_models, means, yerr=stds, capsize=5,
+                      color=bar_colors, edgecolor="black",
+                      linewidth=1.0, alpha=0.9,
+                      error_kw={"elinewidth": 1.3, "ecolor": "black"})
+        best_idx = int(np.argmin(means))
+        bars[best_idx].set_hatch("//")
+        bars[best_idx].set_edgecolor("black")
+        bars[best_idx].set_linewidth(1.8)
+        ax.set_title(metric_labels[metric],
+                     fontsize=13, fontweight="bold")
+        ax.set_ylabel("Value (lower is better)",
+                      fontsize=11, fontweight="bold")
+        ax.grid(axis="y", alpha=0.35, linestyle="--")
+        ax.grid(axis="x", visible=False)
+        for bar, mean in zip(bars, means):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + max(means) * 0.02,
+                    f"{mean:.4f}", ha="center", va="bottom",
+                    fontsize=8.5, fontweight="bold")
+
+    plt.suptitle("Calibration Performance Comparison Across 10-Fold CV",
+                 fontsize=16, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "Calibration_Metrics_BarChart_600dpi.png",
+                dpi=600, bbox_inches="tight", facecolor="white")
+    plt.savefig(OUTPUT_DIR / "Calibration_Metrics_BarChart_600dpi.pdf",
+                bbox_inches="tight", facecolor="white")
+    plt.show()
+
+    print("\nDone. Files saved to:", OUTPUT_DIR)
+
+
+if __name__ == "__main__":
+    main()
