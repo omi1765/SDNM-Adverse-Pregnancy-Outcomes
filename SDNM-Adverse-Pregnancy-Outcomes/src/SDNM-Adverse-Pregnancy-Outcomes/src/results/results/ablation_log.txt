@@ -1,0 +1,83 @@
+Fold 1/10
+Fold 2/10
+Fold 3/10
+Fold 4/10
+Fold 5/10
+Fold 6/10
+Fold 7/10
+Fold 8/10
+Fold 9/10
+Fold 10/10
+
+==============================================================================================================
+ABLATION STUDY — 10-FOLD CV  (mean ± std)
+==============================================================================================================
+Variant                          ACC              F1             MCC               AUC           Brier
+--------------------------------------------------------------------------------------------------------------
+DNM                     0.4990±0.0012    0.5329±0.2664    0.0000±0.0000      0.5000±0.0000    0.2500±0.0000
+DNM+Log                 0.4990±0.0012    0.5329±0.2664    0.0000±0.0000      0.5000±0.0000    0.2500±0.0000
+DNM+Adam                0.4990±0.0012    0.5329±0.2664    0.0000±0.0000      0.5000±0.0000    0.2500±0.0000
+SDNM (GD)               0.8819±0.0293    0.8725±0.0323    0.7726±0.0579      0.9449±0.0230    0.1201±0.0107
+Full SDNM+Adam          0.9936±0.0066    0.9935±0.0067    0.9873±0.0131      0.9973±0.0040    0.0090±0.0040
+==============================================================================================================
+
+Saved: ablation_summary.csv
+
+===========================================================================
+FRIEDMAN TEST — are the ablation variants statistically different?
+===========================================================================
+   AUC:  χ² =  40.0000   p = 4.3284e-08   ***
+    F1:  χ² =  40.0000   p = 4.3284e-08   ***
+   ACC:  χ² =  40.0000   p = 4.3284e-08   ***
+   MCC:  χ² =  40.0000   p = 4.3284e-08   ***
+ Brier:  χ² =  38.3256   p = 9.5997e-08   ***
+
+===========================================================================
+WILCOXON SIGNED-RANK (Full SDNM+Adam vs each variant)
+===========================================================================
+
+--- Metric: AUC ---
+Comparison                                  W       p (raw)      p (Holm)   Sig
+Full SDNM+Adam vs DNM                       55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs DNM+Log                   55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs DNM+Adam                  55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs SDNM (GD)                 55.0    9.7656e-04    3.9062e-03    **
+
+--- Metric: F1 ---
+Comparison                                  W       p (raw)      p (Holm)   Sig
+Full SDNM+Adam vs DNM                       55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs DNM+Log                   55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs DNM+Adam                  55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs SDNM (GD)                 55.0    9.7656e-04    3.9062e-03    **
+
+--- Metric: MCC ---
+Comparison                                  W       p (raw)      p (Holm)   Sig
+Full SDNM+Adam vs DNM                       55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs DNM+Log                   55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs DNM+Adam                  55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs SDNM (GD)                 55.0    9.7656e-04    3.9062e-03    **
+
+--- Metric: ACC ---
+Comparison                                  W       p (raw)      p (Holm)   Sig
+Full SDNM+Adam vs DNM                       55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs DNM+Log                   55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs DNM+Adam                  55.0    9.7656e-04    3.9062e-03    **
+Full SDNM+Adam vs SDNM (GD)                 55.0    9.7656e-04    3.9062e-03    **
+
+===========================================================================
+NEMENYI POST-HOC (mean ranks, lower is better)
+===========================================================================
+
+--- AUC (CD = 1.9290) ---
+  Full SDNM+Adam       rank = 1.000
+  SDNM (GD)            rank = 2.000
+  DNM                  rank = 4.000
+  DNM+Log              rank = 4.000
+  DNM+Adam             rank = 4.000
+
+--- F1 (CD = 1.9290) ---
+  Full SDNM+Adam       rank = 1.000
+  SDNM (GD)            rank = 2.000
+  DNM                  rank = 4.000
+  DNM+Log              rank = 4.000
+  DNM+Adam             rank = 4.000
